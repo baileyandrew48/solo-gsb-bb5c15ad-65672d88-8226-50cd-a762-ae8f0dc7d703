@@ -18,7 +18,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from .conflicts import COMMIT, REVEAL, PhaseWindow, sweep_conflicts
-from . import clock, intervals, merkle
+from . import calibration, clock, intervals, merkle
 from .database import Base, engine, get_db
 from .hashing import HASH_SCHEME, compute_commitment
 from .models import Commitment, DeadlineExtension, Event, Reveal, Settlement
@@ -49,6 +49,11 @@ from .schemas import (
     MerkleProofVerifyRequest,
     MerkleProofVerifyOut,
     PriorRevealSourceOut,
+    ProbabilityCalibrationBinOut,
+    ProbabilityCalibrationInvalidOut,
+    ProbabilityCalibrationOut,
+    ProbabilityCalibrationPredictionOut,
+    ProbabilityCalibrationRequest,
     RevealBatchCreate,
     RevealBatchOut,
     RevealCreate,
@@ -1374,6 +1379,159 @@ def get_interval_report(event_id: UUID, db: Session = Depends(get_db)):
                 reason=e.reason,
             )
             for e in report.invalid
+        ],
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 跨事件概率校准报告
+# --------------------------------------------------------------------------- #
+
+# 校准报告只接受结算标准结果为精确 "0" / "1" 的事件
+BINARY_STANDARD_RESULTS = {"0", "1"}
+
+
+@app.post("/events/probability-calibration-report", response_model=ProbabilityCalibrationOut)
+def probability_calibration_report(
+    payload: ProbabilityCalibrationRequest, db: Session = Depends(get_db)
+):
+    """对 1～100 个已结算二元事件生成跨事件概率校准报告（纯只读）。
+
+    输入与前置校验（重复 ID 保序去重，按去重后顺序找到第一个不满足条件
+    的事件即报错）：
+      - 事件 ID 数量为 1～100（请求体层面 422），重复 ID 去重；
+      - 任一事件不存在 -> 404 EVENT_NOT_FOUND；
+      - 任一事件未结算 -> 409 CALIBRATION_EVENT_NOT_SETTLED；
+      - 任一事件的结算标准结果不是逐字符精确的 ``"0"`` 或 ``"1"``
+        -> 422 CALIBRATION_STANDARD_RESULT_NOT_BINARY。
+
+    通过校验后读取这些事件的全部承诺与揭示：
+      - 每条已揭示原文按严格语法解析为概率：仅接受**无空白、无符号、
+        无指数**且位于闭区间 [0, 1] 的十进制数；解析失败者逐条列入
+        ``invalid``（INVALID_FORMAT / OUT_OF_RANGE），不参与计分；
+      - 从未揭示的承诺单独计入 ``unrevealed_commitment_count``；
+      - 每条有效预测的实际结果取所属事件结算标准结果（"0"->0, "1"->1），
+        用 ``decimal.Decimal`` 精确计算平方误差 (p-y)^2；Brier 均分为全部
+        有效预测平方误差的算术平均（无有效预测时为 null）；
+      - 按 [0,0.1)、[0.1,0.2)、…、[0.8,0.9)、[0.9,1] 十个区间分箱
+        （边界 k/10 归入右侧箱，端点 1 在最后一箱），逐箱汇总样本数、
+        预测均值与实际为 1 的频率；空样本均值与频率均为 null。
+
+    结果字段按固定顺序返回；所有计算得到的数值统一四舍六入五成双
+    （ROUND_HALF_EVEN）量化到 6 位小数字符串。接口不修改任何数据。
+    """
+    # 保序去重：同一事件只参与一次校准
+    event_ids = list(dict.fromkeys(payload.event_ids))
+
+    events = db.query(Event).filter(Event.id.in_(event_ids)).all()
+    events_by_id = {e.id: e for e in events}
+    missing = next((eid for eid in event_ids if eid not in events_by_id), None)
+    if missing is not None:
+        raise api_error(404, "EVENT_NOT_FOUND", f"事件 {missing} 不存在")
+
+    settlements = (
+        db.query(Settlement).filter(Settlement.event_id.in_(event_ids)).all()
+    )
+    settlements_by_event = {s.event_id: s for s in settlements}
+
+    # 按去重后顺序依次校验「已结算」与「标准结果精确为 0/1」，首个违规即报错
+    for eid in event_ids:
+        settlement = settlements_by_event.get(eid)
+        if settlement is None:
+            raise api_error(
+                409,
+                "CALIBRATION_EVENT_NOT_SETTLED",
+                f"概率校准报告仅对已结算事件生成：事件 {eid} 尚未结算",
+            )
+        if settlement.standard_result not in BINARY_STANDARD_RESULTS:
+            raise api_error(
+                422,
+                "CALIBRATION_STANDARD_RESULT_NOT_BINARY",
+                f"事件 {eid} 的结算标准结果 {settlement.standard_result!r} 不是精确的 "
+                '"0" 或 "1"，无法参与概率校准',
+            )
+
+    # 一次性取出这些事件的全部承诺及揭示（每个承诺至多一条揭示）
+    rows = (
+        db.query(Commitment, Reveal)
+        .outerjoin(Reveal, Reveal.commitment_id == Commitment.id)
+        .filter(Commitment.event_id.in_(event_ids))
+        .all()
+    )
+
+    sources: list[calibration.CalibrationSource] = []
+    unrevealed_count = 0
+    for commitment, reveal in rows:
+        if reveal is None:
+            unrevealed_count += 1
+            continue
+        outcome = int(settlements_by_event[commitment.event_id].standard_result)
+        sources.append(
+            calibration.CalibrationSource(
+                event_id=commitment.event_id,
+                commitment_id=commitment.id,
+                committed_at=as_utc(commitment.created_at),
+                original_text=reveal.original_text,
+                outcome=outcome,
+            )
+        )
+
+    report = calibration.build_calibration_report(sources, unrevealed_count)
+
+    return ProbabilityCalibrationOut(
+        generated_at=now_utc(),
+        event_count=len(event_ids),
+        event_ids=event_ids,
+        valid_prediction_count=len(report.predictions),
+        invalid_count=len(report.invalid),
+        unrevealed_commitment_count=report.unrevealed_count,
+        brier_mean=(
+            f"{calibration.quantize6(report.brier_mean):f}"
+            if report.brier_mean is not None
+            else None
+        ),
+        predictions=[
+            ProbabilityCalibrationPredictionOut(
+                event_id=p.event_id,
+                commitment_id=p.commitment_id,
+                committed_at=p.committed_at,
+                original_text=p.original_text,
+                outcome=p.outcome,
+                squared_error=f"{calibration.quantize6(p.squared_error):f}",
+            )
+            for p in report.predictions
+        ],
+        invalid=[
+            ProbabilityCalibrationInvalidOut(
+                event_id=p.event_id,
+                commitment_id=p.commitment_id,
+                committed_at=p.committed_at,
+                original_text=p.original_text,
+                reason=p.reason,
+            )
+            for p in report.invalid
+        ],
+        bins=[
+            ProbabilityCalibrationBinOut(
+                index=b.index,
+                range=(
+                    f"[{b.lower:.1f},{b.upper:.1f})"
+                    if b.index < calibration.BIN_COUNT - 1
+                    else f"[{b.lower:.1f},{b.upper:.1f}]"
+                ),
+                lower_bound=f"{b.lower:.1f}",
+                upper_bound=f"{b.upper:.1f}",
+                count=b.count,
+                mean=(
+                    f"{calibration.quantize6(b.mean):f}" if b.mean is not None else None
+                ),
+                positive_rate=(
+                    f"{calibration.quantize6(b.positive_rate):f}"
+                    if b.positive_rate is not None
+                    else None
+                ),
+            )
+            for b in report.bins
         ],
     )
 

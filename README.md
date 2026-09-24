@@ -68,6 +68,7 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 | POST | `/events/{id}/settlement` | closed 阶段永久确认标准结果并结算（仅一次） |
 | GET | `/events/{id}/settlement` | 查询结算状态与结果（未结算返回明确状态） |
 | GET | `/events/{id}/interval-report` | 已结算事件的数值区间预测报告（只读，十进制精确覆盖判定与排名） |
+| POST | `/events/probability-calibration-report` | 跨事件概率校准报告（只读，Decimal 精确 Brier 均分与十分箱校准汇总） |
 | POST | `/utils/commitment` | 按约定方案计算承诺哈希 |
 | GET | `/health` | 健康检查 |
 
@@ -838,6 +839,119 @@ curl -s http://localhost:8000/events/<EVENT_ID>/interval-report
 | 422 | `STANDARD_RESULT_NOT_FINITE_DECIMAL` | 结算标准结果不是有限十进制数 |
 | 422 | — | 事件 ID 非 UUID |
 
+## 跨事件概率校准报告（`POST /events/probability-calibration-report`）
+
+对 **1～100 个已结算的二元事件**生成只读的跨事件概率校准报告：把每个事件的
+已揭示原文当作预测概率，以结算标准结果（精确的 `"0"` / `"1"`）为实际结果，
+用 `decimal.Decimal` 精确计算每条预测的平方误差、总体 Brier 均分，并按十个
+概率区间汇总预测均值与实际为 1 的频率（可靠性分箱）。接口不修改任何数据。
+
+**前置校验**（请求中的重复 ID 自动保序去重，按去重后顺序找到第一个不满足
+条件的事件即报错）：
+
+| HTTP | code | 场景 |
+|------|------|------|
+| 404 | `EVENT_NOT_FOUND` | 任一事件不存在 |
+| 409 | `CALIBRATION_EVENT_NOT_SETTLED` | 任一事件尚未结算 |
+| 422 | `CALIBRATION_STANDARD_RESULT_NOT_BINARY` | 任一事件结算标准结果不是逐字符精确的 `"0"` 或 `"1"`（如 `"1.0"`、`"00"`、`"true"`、`"是"` 均拒绝） |
+| 422 | — | 事件 ID 数量不在 1～100、ID 非 UUID 或请求体结构错误 |
+
+**概率原文语法**（严格匹配）：仅接受**无空白、无符号、无指数**且数值位于
+闭区间 **[0, 1]** 的十进制数（仅 ASCII 数字）：
+
+```
+probability := ( 数字+ ["." 数字*] | "." 数字+ )
+```
+
+合法示例：`"0"`、`"1"`、`"0.5"`、`".25"`、`"1."`、`"00.10"`；
+非法原文逐条列入响应的 `invalid` 并注明原因，**不参与计分**：
+
+| reason | 含义 | 示例 |
+|--------|------|------|
+| `INVALID_FORMAT` | 含空白、正负号、指数记法，或不是十进制数 | `" 0.5"`、`"+0.5"`、`"-0"`、`"1e-1"`、`"5E0"`、`""`、`"NaN"`、`"Infinity"`、`"1_000"` |
+| `OUT_OF_RANGE` | 语法为十进制数但数值不在 [0, 1] | `"1.0000000001"`、`"9"`、`"10"` |
+
+从未揭示的承诺不参与解析与计分，单独计入 `unrevealed_commitment_count`。
+
+**计分与分箱**（全程十进制精确计算，不经过浮点）：
+
+- 每条有效预测的实际结果 `y` 取所属事件的结算标准结果（`"0"→0`、`"1"→1`），
+  平方误差 `squared_error = (p - y)^2`；
+- 总体 **Brier 均分** = 全部有效预测平方误差的算术平均；无有效预测时为
+  `null`；
+- 十个分箱固定返回，边界归属确定——`k/10`（k=1..9）归入**右侧**箱，
+  端点 `1` 在最后一箱：
+
+  | index | range | index | range |
+  |---|---|---|---|
+  | 0 | `[0.0,0.1)` | 5 | `[0.5,0.6)` |
+  | 1 | `[0.1,0.2)` | 6 | `[0.6,0.7)` |
+  | 2 | `[0.2,0.3)` | 7 | `[0.7,0.8)` |
+  | 3 | `[0.3,0.4)` | 8 | `[0.8,0.9)` |
+  | 4 | `[0.4,0.5)` | 9 | `[0.9,1.0]` |
+
+  每箱给出 `count`（样本数）、`mean`（箱内预测均值）与 `positive_rate`
+  （实际为 1 的频率）；**空样本的 `mean` 与 `positive_rate` 为 `null`**。
+- 所有计算得到的数值统一**四舍六入五成双**（`ROUND_HALF_EVEN`）量化到
+  **6 位小数**输出（如 `0.062500`、`0.175000`、`0.666667`）；揭示原文
+  仍逐字回显在 `original_text`。
+- 有效预测与无效条目均按 `(event_id, committed_at, commitment_id)` 稳定
+  排序；顶层字段与 10 个分箱按固定顺序返回；`event_ids` 回显去重后的事件
+  ID（按请求中首次出现的顺序）。
+
+```bash
+curl -s -X POST http://localhost:8000/events/probability-calibration-report \
+  -H 'Content-Type: application/json' \
+  -d '{"event_ids": ["<EVENT_ID_1>", "<EVENT_ID_2>", "<EVENT_ID_1>"]}'
+```
+
+```json
+{
+  "generated_at": "2030-08-01T03:00:00Z",
+  "event_count": 2,
+  "event_ids": ["<EVENT_ID_1>", "<EVENT_ID_2>"],
+  "valid_prediction_count": 5,
+  "invalid_count": 2,
+  "unrevealed_commitment_count": 3,
+  "brier_mean": "0.175000",
+  "predictions": [
+    {"event_id": "<EVENT_ID_1>", "commitment_id": "<CID_1>",
+     "committed_at": "2030-08-01T00:05:00Z",
+     "original_text": "1", "outcome": 1, "squared_error": "0.000000"},
+    {"event_id": "<EVENT_ID_1>", "commitment_id": "<CID_2>",
+     "committed_at": "2030-08-01T00:06:00Z",
+     "original_text": "0.75", "outcome": 1, "squared_error": "0.062500"},
+    {"event_id": "<EVENT_ID_1>", "commitment_id": "<CID_3>",
+     "committed_at": "2030-08-01T00:07:00Z",
+     "original_text": "0.25", "outcome": 1, "squared_error": "0.562500"},
+    {"event_id": "<EVENT_ID_2>", "commitment_id": "<CID_4>",
+     "committed_at": "2030-08-01T00:08:00Z",
+     "original_text": "0", "outcome": 0, "squared_error": "0.000000"},
+    {"event_id": "<EVENT_ID_2>", "commitment_id": "<CID_5>",
+     "committed_at": "2030-08-01T00:09:00Z",
+     "original_text": "0.5", "outcome": 0, "squared_error": "0.250000"}
+  ],
+  "invalid": [
+    {"event_id": "<EVENT_ID_1>", "commitment_id": "<CID_6>",
+     "committed_at": "2030-08-01T00:10:00Z",
+     "original_text": "nope", "reason": "INVALID_FORMAT"},
+    {"event_id": "<EVENT_ID_1>", "commitment_id": "<CID_7>",
+     "committed_at": "2030-08-01T00:11:00Z",
+     "original_text": "1.5", "reason": "OUT_OF_RANGE"}
+  ],
+  "bins": [
+    {"index": 0, "range": "[0.0,0.1)", "lower_bound": "0.0", "upper_bound": "0.1",
+     "count": 1, "mean": "0.000000", "positive_rate": "0.000000"},
+    {"index": 1, "range": "[0.1,0.2)", "lower_bound": "0.1", "upper_bound": "0.2",
+     "count": 0, "mean": null, "positive_rate": null},
+    {"index": 2, "range": "[0.2,0.3)", "lower_bound": "0.2", "upper_bound": "0.3",
+     "count": 1, "mean": "0.250000", "positive_rate": "1.000000"}
+  ]
+}
+```
+
+> 上例 `bins` 仅展示前 3 箱；实际响应始终包含全部 10 箱（`index` 0～9）。
+
 ## 错误响应
 
 错误统一返回 `{"detail": {"code": "...", "message": "..."}}`，且**均不改变任何状态**
@@ -865,8 +979,10 @@ curl -s http://localhost:8000/events/<EVENT_ID>/interval-report
 | 409 | `PROOF_NOT_AVAILABLE` | 未过提交截止即请求承诺集合 Merkle 根或成员证明 |
 | 409 | `SETTLEMENT_ALREADY_CONFIRMED` | 事件已永久结算，重复结算被拒绝且不改写既有结果（`detail.conflicts[0].existing` 回显首次结果） |
 | 409 | `INTERVAL_REPORT_NOT_SETTLED` | 数值区间报告仅对已结算事件生成，事件尚未结算 |
+| 409 | `CALIBRATION_EVENT_NOT_SETTLED` | 跨事件概率校准报告中的任一事件尚未结算 |
 | 422 | `STANDARD_RESULT_NOT_FINITE_DECIMAL` | 结算标准结果不是有限十进制数，无法生成数值区间报告 |
-| 422 | — | 请求体格式校验失败（如哈希非 64 位十六进制、截止时间无时区、延长缺少 reason、结算标准结果为空） |
+| 422 | `CALIBRATION_STANDARD_RESULT_NOT_BINARY` | 概率校准事件的结算标准结果不是精确的 "0" 或 "1" |
+| 422 | — | 请求体格式校验失败（如哈希非 64 位十六进制、截止时间无时区、延长缺少 reason、结算标准结果为空、概率校准事件 ID 数量不在 1～100） |
 
 「仅首次匹配的揭示生效」由 `reveals.commitment_id` 唯一约束保证：并发揭示同一承诺时，
 后到者事务回滚并收到 `DUPLICATE_REVEAL`。
@@ -930,6 +1046,7 @@ app/
   hashing.py    # 承诺哈希方案实现
   merkle.py     # 承诺集合 Merkle 树：叶/内部域前缀、末项复制、成员证明与严格校验（纯函数）
   intervals.py  # 数值区间预测报告：有限十进制解析、精确覆盖判定与命中排名（纯函数）
+  calibration.py # 跨事件概率校准报告：[0,1] 概率严格解析、Decimal Brier 均分与十分箱汇总（纯函数）
   database.py   # 引擎与会话（DATABASE_URL 可配置）
 tests/test_api.py             # 业务规则冒烟测试（SQLite + 模拟时钟）
 tests/test_snapshot.py        # 历史时刻快照：延长回放、阶段与计数重放、400/404 错误
@@ -941,6 +1058,7 @@ tests/test_batch_commitments.py  # 批量承诺：逐项冲突、整体回滚与
 tests/test_batch_reveals.py   # 批量揭示：四类逐项冲突、整体回滚与并发仅首次生效
 tests/test_settlement.py      # 永久结算：精确匹配计数、未结算状态、重复结算冲突与不改写
 tests/test_interval_report.py # 数值区间报告：十进制精确覆盖判定、命中排名、无效/未揭示分类与只读
+tests/test_calibration_report.py # 跨事件概率校准：严格概率解析、Brier 均分、十分箱边界与五成双量化
 tests/test_merkle.py          # Merkle 纯函数：空根/单叶、末项复制、域分离、成员证明与严格层级校验
 tests/test_merkle_proofs_api.py  # 集合证明 API：阶段门禁、根/证明签发、本地校验、404/409 与现有流程不受影响
 Dockerfile

@@ -233,6 +233,81 @@ class IntervalReportOut(BaseModel):
     )
 
 
+class ProbabilityCalibrationRequest(BaseModel):
+    event_ids: list[UUID] = Field(
+        min_length=1,
+        max_length=100,
+        description=(
+            "待校准的 1～100 个已结算事件 ID（重复 ID 自动去重；"
+            "任一事件不存在、未结算或结算标准结果不是精确的 \"0\"/\"1\" 均报错）"
+        ),
+    )
+
+
+class ProbabilityCalibrationPredictionOut(BaseModel):
+    event_id: UUID = Field(description="该预测所属事件")
+    commitment_id: UUID = Field(description="该预测对应的承诺 ID")
+    committed_at: datetime = Field(description="承诺提交时间（UTC）")
+    original_text: str = Field(description="揭示原文逐字回显（无空白、无符号、无指数且在 [0,1] 的十进制数）")
+    outcome: int = Field(description="所属事件结算标准结果对应的实际结果：0 | 1")
+    squared_error: str = Field(
+        description="平方误差 (概率 - 实际结果)^2 的十进制精确值，四舍六入五成双至 6 位小数"
+    )
+
+
+class ProbabilityCalibrationInvalidOut(BaseModel):
+    event_id: UUID = Field(description="该无效揭示所属事件")
+    commitment_id: UUID = Field(description="该无效揭示对应的承诺 ID")
+    committed_at: datetime = Field(description="承诺提交时间（UTC）")
+    original_text: str = Field(description="无法解析为 [0,1] 概率的揭示原文（逐字回显）")
+    reason: str = Field(
+        description="无效原因：INVALID_FORMAT（不是无空白/无符号/无指数的十进制数）| OUT_OF_RANGE（数值不在 [0,1]）"
+    )
+
+
+class ProbabilityCalibrationBinOut(BaseModel):
+    index: int = Field(description="分箱下标（0～9，固定顺序）")
+    range: str = Field(description="分箱区间标签：[0.0,0.1) … [0.8,0.9) [0.9,1.0]，边界归属确定")
+    lower_bound: str = Field(description="分箱左边界（含），精确十进制")
+    upper_bound: str = Field(description="分箱右边界（不含；最后一箱 [0.9,1.0] 含右端点 1）")
+    count: int = Field(description="箱内有效预测样本数")
+    mean: Optional[str] = Field(
+        default=None,
+        description="箱内预测概率均值（十进制精确计算，四舍六入五成双至 6 位小数）；空样本为 null",
+    )
+    positive_rate: Optional[str] = Field(
+        default=None,
+        description="箱内实际结果为 1 的频率（四舍六入五成双至 6 位小数）；空样本为 null",
+    )
+
+
+class ProbabilityCalibrationOut(BaseModel):
+    generated_at: datetime
+    event_count: int = Field(description="去重后实际参与校准的事件数量")
+    event_ids: list[UUID] = Field(description="去重后的事件 ID（按请求中首次出现的顺序）")
+    valid_prediction_count: int = Field(description="成功解析为 [0,1] 概率的揭示数")
+    invalid_count: int = Field(description="无法解析为 [0,1] 概率的揭示数")
+    unrevealed_commitment_count: int = Field(
+        description="这些事件中从未揭示的承诺总数（单独统计，不参与解析与计分）"
+    )
+    brier_mean: Optional[str] = Field(
+        default=None,
+        description=(
+            "总体 Brier 均分：全部有效预测平方误差的算术平均（十进制精确计算，"
+            "四舍六入五成双至 6 位小数）；无有效预测时为 null"
+        ),
+    )
+    predictions: list[ProbabilityCalibrationPredictionOut] = Field(
+        description="有效预测，按 (事件 ID, 承诺提交时间, 承诺 ID) 稳定排序"
+    )
+    invalid: list[ProbabilityCalibrationInvalidOut] = Field(
+        description="无效揭示原文逐条列出，按 (事件 ID, 承诺提交时间, 承诺 ID) 稳定排序"
+    )
+    bins: list[ProbabilityCalibrationBinOut] = Field(
+        description="十个概率分箱的汇总，固定按下标 0～9 顺序返回，空样本的均值与正例频率为 null"
+    )
+
+
 class ConflictRequest(BaseModel):
     event_ids: list[UUID] = Field(
         default_factory=list,
