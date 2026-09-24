@@ -18,13 +18,18 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from .conflicts import COMMIT, REVEAL, PhaseWindow, sweep_conflicts
-from . import clock, intervals, merkle
+from . import calibration, clock, intervals, merkle
 from .database import Base, engine, get_db
 from .hashing import HASH_SCHEME, compute_commitment
 from .models import Commitment, DeadlineExtension, Event, Reveal, Settlement
 from .scheduling import PHASES as SCHEDULE_PHASES, schedule
 from .schemas import (
     COMMITMENT_HASH_PATTERN,
+    CalibrationBinOut,
+    CalibrationInvalidOut,
+    CalibrationPredictionOut,
+    CalibrationReportOut,
+    CalibrationReportRequest,
     CommitmentBatchCreate,
     CommitmentBatchOut,
     CommitmentCreate,
@@ -1374,6 +1379,157 @@ def get_interval_report(event_id: UUID, db: Session = Depends(get_db)):
                 reason=e.reason,
             )
             for e in report.invalid
+        ],
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 跨事件概率校准报告
+# --------------------------------------------------------------------------- #
+
+@app.post("/events/calibration-report", response_model=CalibrationReportOut)
+def cross_event_calibration_report(
+    payload: CalibrationReportRequest, db: Session = Depends(get_db)
+):
+    """对 1～100 个已结算的 0/1 事件生成跨事件概率校准报告（纯只读）。
+
+    输入与前置校验（重复 ID 按首次出现顺序去重；任一不满足即整体报错）：
+      - 接收 1～100 个事件 ID（数量越界 / ID 非 UUID 由请求体 422 拦截）；
+      - 任一事件不存在 -> 404 EVENT_NOT_FOUND；
+      - 任一事件未结算 -> 409 CALIBRATION_EVENT_NOT_SETTLED；
+      - 任一事件结算标准结果不是逐字符精确的 "0" 或 "1"（如 " 1"、
+        "1.0"、"yes"）-> 422 CALIBRATION_STANDARD_RESULT_NOT_BINARY。
+
+    概率解析（读取这些事件**已揭示**的原文 original_text）：
+      - 只接受无空白、无符号、无指数且位于闭区间 [0, 1] 的纯十进制记法
+        （如 "0"、"1"、"0.75"、".5"）；" 0.5"、"+1"、"1e-1"、
+        "1.0000001"、"明天下雨" 等逐条列入 invalid_predictions 并注明
+        INVALID_FORMAT / OUT_OF_RANGE；
+      - 从未揭示的承诺不参与解析，单独计入 unrevealed_commitment_count。
+
+    计算与输出（decimal.Decimal 精确计算，不经过浮点）：
+      - 每条有效预测给出 squared_error = (概率 - 实际)^2；总体 brier_mean
+        为全部有效预测精确平方误差的算术平均（无有效样本时为 null）；
+      - 十个固定区间 [0,0.1)、…、[0.8,0.9)、[0.9,1]（最后一个含上界 1）
+        各自汇总样本数、预测均值与实际为 1 的频率；空样本均值/频率为 null；
+      - 所有对外数值统一四舍六入五成双（ROUND_HALF_EVEN）至 6 位小数字符串；
+      - 事件按去重后的请求顺序、明细按 (事件序, 承诺提交时间, 承诺 ID)
+        固定排序；接口不修改任何数据，重复请求结果一致。
+    """
+    now = now_utc()
+    # 保序去重：同一事件只参与一次校准
+    event_ids = list(dict.fromkeys(payload.event_ids))
+
+    events = db.query(Event).filter(Event.id.in_(event_ids)).all()
+    events_by_id = {e.id: e for e in events}
+    missing = next((eid for eid in event_ids if eid not in events_by_id), None)
+    if missing is not None:
+        raise api_error(404, "EVENT_NOT_FOUND", f"事件 {missing} 不存在")
+
+    settlements = (
+        db.query(Settlement).filter(Settlement.event_id.in_(event_ids)).all()
+    )
+    settlements_by_id = {s.event_id: s for s in settlements}
+
+    # 前置校验按去重后的请求顺序逐项进行：未结算优先于标准结果格式
+    for event_id in event_ids:
+        settlement = settlements_by_id.get(event_id)
+        if settlement is None:
+            raise api_error(
+                409,
+                "CALIBRATION_EVENT_NOT_SETTLED",
+                f"概率校准报告仅对已结算事件生成：事件 {event_id} 尚未结算",
+            )
+    outcomes: list[tuple[UUID, int]] = []
+    for event_id in event_ids:
+        raw = settlements_by_id[event_id].standard_result
+        if raw == "0":
+            actual = 0
+        elif raw == "1":
+            actual = 1
+        else:
+            raise api_error(
+                422,
+                "CALIBRATION_STANDARD_RESULT_NOT_BINARY",
+                f"事件 {event_id} 的结算标准结果为 {raw!r}，不是精确的 \"0\" 或 \"1\"，"
+                "无法生成概率校准报告",
+            )
+        outcomes.append((event_id, actual))
+
+    # 一次性取出这些事件的全部承诺及其揭示（每个承诺至多一条揭示）
+    rows = (
+        db.query(Commitment, Reveal)
+        .outerjoin(Reveal, Reveal.commitment_id == Commitment.id)
+        .filter(Commitment.event_id.in_(event_ids))
+        .all()
+    )
+    revealed = [
+        (
+            commitment.event_id,
+            commitment.id,
+            as_utc(commitment.created_at),
+            reveal.original_text,
+        )
+        for commitment, reveal in rows
+        if reveal is not None
+    ]
+    unrevealed_count = sum(1 for _, reveal in rows if reveal is None)
+
+    report = calibration.build_calibration_report(outcomes, revealed, unrevealed_count)
+
+    return CalibrationReportOut(
+        generated_at=now,
+        event_count=len(event_ids),
+        event_ids=event_ids,
+        revealed_count=len(revealed),
+        unrevealed_commitment_count=report.unrevealed_count,
+        valid_prediction_count=report.valid_count,
+        invalid_prediction_count=report.invalid_count,
+        brier_mean=(str(report.brier_mean) if report.brier_mean is not None else None),
+        bins=[
+            CalibrationBinOut(
+                index=bin_entry.index,
+                lower_inclusive=str(
+                    calibration.quantize_six(bin_entry.lower_inclusive)
+                ),
+                upper_exclusive=str(
+                    calibration.quantize_six(bin_entry.upper_exclusive)
+                ),
+                mean_prediction=(
+                    str(bin_entry.mean_prediction)
+                    if bin_entry.mean_prediction is not None
+                    else None
+                ),
+                positive_rate=(
+                    str(bin_entry.positive_rate)
+                    if bin_entry.positive_rate is not None
+                    else None
+                ),
+                sample_count=bin_entry.sample_count,
+            )
+            for bin_entry in report.bins
+        ],
+        valid_predictions=[
+            CalibrationPredictionOut(
+                event_id=p.event_id,
+                commitment_id=p.commitment_id,
+                committed_at=p.committed_at,
+                original_text=p.original_text,
+                probability=str(calibration.quantize_six(p.probability)),
+                actual=p.actual,
+                squared_error=str(p.squared_error),
+            )
+            for p in report.valid_predictions
+        ],
+        invalid_predictions=[
+            CalibrationInvalidOut(
+                event_id=p.event_id,
+                commitment_id=p.commitment_id,
+                committed_at=p.committed_at,
+                original_text=p.original_text,
+                reason=p.reason,
+            )
+            for p in report.invalid_predictions
         ],
     )
 

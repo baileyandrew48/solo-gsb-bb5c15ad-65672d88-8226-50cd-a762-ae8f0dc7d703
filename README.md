@@ -68,6 +68,7 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 | POST | `/events/{id}/settlement` | closed 阶段永久确认标准结果并结算（仅一次） |
 | GET | `/events/{id}/settlement` | 查询结算状态与结果（未结算返回明确状态） |
 | GET | `/events/{id}/interval-report` | 已结算事件的数值区间预测报告（只读，十进制精确覆盖判定与排名） |
+| POST | `/events/calibration-report` | 跨事件概率校准报告（只读，Brier 均分与十区间校准，Decimal 精确计算） |
 | POST | `/utils/commitment` | 按约定方案计算承诺哈希 |
 | GET | `/health` | 健康检查 |
 
@@ -838,6 +839,115 @@ curl -s http://localhost:8000/events/<EVENT_ID>/interval-report
 | 422 | `STANDARD_RESULT_NOT_FINITE_DECIMAL` | 结算标准结果不是有限十进制数 |
 | 422 | — | 事件 ID 非 UUID |
 
+## 跨事件概率校准报告（`POST /events/calibration-report`）
+
+对 **1～100 个已结算的 0/1 事件**生成只读的跨事件概率校准报告：把这些事件
+**已揭示**的原文当作「事件发生概率」预测，与结算标准结果（精确的 `0` 或 `1`）
+逐条比对，输出逐预测平方误差、总体 **Brier 均分**与十个固定概率区间的校准
+汇总。接口为纯只读，不修改任何数据；重复请求结果一致。
+
+**输入与前置校验**（重复 ID 按首次出现顺序去重，任一不满足即整体报错）：
+
+- 请求体 `event_ids` 为 1～100 个事件 ID（空列表、超过 100 个、ID 非 UUID
+  返回 422）；
+- 任一事件不存在返回 `404 EVENT_NOT_FOUND`；
+- 任一事件未结算返回 `409 CALIBRATION_EVENT_NOT_SETTLED`；
+- 任一事件结算标准结果不是**逐字符精确**的 `"0"` 或 `"1"`（如 `" 1"`、
+  `"1.0"`、`"yes"`）返回 `422 CALIBRATION_STANDARD_RESULT_NOT_BINARY`。
+
+**概率解析**（只读取已揭示原文 `original_text`）：
+
+```
+probability := 数字+ ["." 数字*] | "." 数字+
+```
+
+- 只接受**无空白、无符号、无指数**且位于闭区间 `[0, 1]` 的纯十进制记法
+  （如 `0`、`1`、`0.75`、`.5`）；`" 0.5"`、`"+1"`、`"1e-1"`、
+  `"1.0000001"` 等逐条列入 `invalid_predictions` 并注明
+  `INVALID_FORMAT`（格式不符）/ `OUT_OF_RANGE`（数值越界）；
+- 从未揭示的承诺不参与解析，单独计入 `unrevealed_commitment_count`。
+
+**计算与输出**（`decimal.Decimal` 精确计算，全程不经过浮点）：
+
+- 每条有效预测给出 `squared_error = (概率 - 实际)^2`；总体 `brier_mean`
+  为全部有效预测精确平方误差的算术平均（无有效样本时为 `null`）；
+- 十个固定区间 `[0,0.1)`、`[0.1,0.2)`、…、`[0.8,0.9)`、`[0.9,1]`
+  （最后一个含上界 1；`0.1` 属于 `[0.1,0.2)` 而非 `[0,0.1)`）各自汇总
+  `sample_count`、`mean_prediction`（预测均值）与 `positive_rate`
+  （实际为 1 的频率）；空样本区间的均值与频率均为 `null`；
+- 所有对外数值统一**四舍六入五成双**（ROUND_HALF_EVEN）至 6 位小数字符串；
+- 事件按去重后的请求顺序、明细按 `(事件序, 承诺提交时间, 承诺 ID)`
+  固定排序。
+
+```bash
+curl -s -X POST http://localhost:8000/events/calibration-report \
+  -H 'Content-Type: application/json' \
+  -d '{"event_ids": ["<EVENT_ID_1>", "<EVENT_ID_2>"]}'
+```
+
+```json
+{
+  "generated_at": "2030-01-02T00:00:05Z",
+  "event_count": 2,
+  "event_ids": ["<EVENT_ID_1>", "<EVENT_ID_2>"],
+  "revealed_count": 5,
+  "unrevealed_commitment_count": 1,
+  "valid_prediction_count": 4,
+  "invalid_prediction_count": 1,
+  "brier_mean": "0.302500",
+  "bins": [
+    {"index": 0, "lower_inclusive": "0.000000", "upper_exclusive": "0.100000",
+     "mean_prediction": null, "positive_rate": null, "sample_count": 0},
+    {"index": 1, "lower_inclusive": "0.100000", "upper_exclusive": "0.200000",
+     "mean_prediction": "0.100000", "positive_rate": "0.000000", "sample_count": 1},
+    {"index": 2, "lower_inclusive": "0.200000", "upper_exclusive": "0.300000",
+     "mean_prediction": null, "positive_rate": null, "sample_count": 0},
+    {"index": 3, "lower_inclusive": "0.300000", "upper_exclusive": "0.400000",
+     "mean_prediction": null, "positive_rate": null, "sample_count": 0},
+    {"index": 4, "lower_inclusive": "0.400000", "upper_exclusive": "0.500000",
+     "mean_prediction": null, "positive_rate": null, "sample_count": 0},
+    {"index": 5, "lower_inclusive": "0.500000", "upper_exclusive": "0.600000",
+     "mean_prediction": null, "positive_rate": null, "sample_count": 0},
+    {"index": 6, "lower_inclusive": "0.600000", "upper_exclusive": "0.700000",
+     "mean_prediction": "0.600000", "positive_rate": "1.000000", "sample_count": 1},
+    {"index": 7, "lower_inclusive": "0.700000", "upper_exclusive": "0.800000",
+     "mean_prediction": null, "positive_rate": null, "sample_count": 0},
+    {"index": 8, "lower_inclusive": "0.800000", "upper_exclusive": "0.900000",
+     "mean_prediction": "0.800000", "positive_rate": "1.000000", "sample_count": 1},
+    {"index": 9, "lower_inclusive": "0.900000", "upper_exclusive": "1.000000",
+     "mean_prediction": "1.000000", "positive_rate": "0.000000", "sample_count": 1}
+  ],
+  "valid_predictions": [
+    {"event_id": "<EVENT_ID_1>", "commitment_id": "<CID_1>",
+     "committed_at": "2030-01-01T00:10:00Z", "original_text": "0.8",
+     "probability": "0.800000", "actual": 1, "squared_error": "0.040000"},
+    {"event_id": "<EVENT_ID_1>", "commitment_id": "<CID_2>",
+     "committed_at": "2030-01-01T00:20:00Z", "original_text": "0.6",
+     "probability": "0.600000", "actual": 1, "squared_error": "0.160000"},
+    {"event_id": "<EVENT_ID_2>", "commitment_id": "<CID_3>",
+     "committed_at": "2030-01-01T00:05:00Z", "original_text": "0.1",
+     "probability": "0.100000", "actual": 0, "squared_error": "0.010000"},
+    {"event_id": "<EVENT_ID_2>", "commitment_id": "<CID_4>",
+     "committed_at": "2030-01-01T00:15:00Z", "original_text": "1",
+     "probability": "1.000000", "actual": 0, "squared_error": "1.000000"}
+  ],
+  "invalid_predictions": [
+    {"event_id": "<EVENT_ID_2>", "commitment_id": "<CID_5>",
+     "committed_at": "2030-01-01T00:25:00Z", "original_text": "1.2",
+     "reason": "OUT_OF_RANGE"}
+  ]
+}
+```
+
+| HTTP | code | 场景 |
+|------|------|------|
+| 200 | — | 报告生成成功（纯只读，重复请求结果一致） |
+| 404 | `EVENT_NOT_FOUND` | 请求中的任一事件 ID 不存在（先去重再校验） |
+| 409 | `CALIBRATION_EVENT_NOT_SETTLED` | 任一事件尚未结算（含 closed 但未结算） |
+| 422 | `CALIBRATION_STANDARD_RESULT_NOT_BINARY` | 任一事件结算标准结果不是精确的 `0`/`1` |
+| 422 | — | 事件 ID 数量不在 1～100、ID 非 UUID 或请求体结构错误 |
+
+
 ## 错误响应
 
 错误统一返回 `{"detail": {"code": "...", "message": "..."}}`，且**均不改变任何状态**
@@ -865,7 +975,9 @@ curl -s http://localhost:8000/events/<EVENT_ID>/interval-report
 | 409 | `PROOF_NOT_AVAILABLE` | 未过提交截止即请求承诺集合 Merkle 根或成员证明 |
 | 409 | `SETTLEMENT_ALREADY_CONFIRMED` | 事件已永久结算，重复结算被拒绝且不改写既有结果（`detail.conflicts[0].existing` 回显首次结果） |
 | 409 | `INTERVAL_REPORT_NOT_SETTLED` | 数值区间报告仅对已结算事件生成，事件尚未结算 |
+| 409 | `CALIBRATION_EVENT_NOT_SETTLED` | 概率校准报告仅对已结算事件生成，请求中任一事件尚未结算 |
 | 422 | `STANDARD_RESULT_NOT_FINITE_DECIMAL` | 结算标准结果不是有限十进制数，无法生成数值区间报告 |
+| 422 | `CALIBRATION_STANDARD_RESULT_NOT_BINARY` | 请求中任一事件结算标准结果不是精确的 `0`/`1`，无法生成概率校准报告 |
 | 422 | — | 请求体格式校验失败（如哈希非 64 位十六进制、截止时间无时区、延长缺少 reason、结算标准结果为空） |
 
 「仅首次匹配的揭示生效」由 `reveals.commitment_id` 唯一约束保证：并发揭示同一承诺时，
@@ -930,6 +1042,7 @@ app/
   hashing.py    # 承诺哈希方案实现
   merkle.py     # 承诺集合 Merkle 树：叶/内部域前缀、末项复制、成员证明与严格校验（纯函数）
   intervals.py  # 数值区间预测报告：有限十进制解析、精确覆盖判定与命中排名（纯函数）
+  calibration.py # 跨事件概率校准报告：概率原文解析、Brier 均分与十区间校准（纯函数）
   database.py   # 引擎与会话（DATABASE_URL 可配置）
 tests/test_api.py             # 业务规则冒烟测试（SQLite + 模拟时钟）
 tests/test_snapshot.py        # 历史时刻快照：延长回放、阶段与计数重放、400/404 错误
@@ -941,6 +1054,7 @@ tests/test_batch_commitments.py  # 批量承诺：逐项冲突、整体回滚与
 tests/test_batch_reveals.py   # 批量揭示：四类逐项冲突、整体回滚与并发仅首次生效
 tests/test_settlement.py      # 永久结算：精确匹配计数、未结算状态、重复结算冲突与不改写
 tests/test_interval_report.py # 数值区间报告：十进制精确覆盖判定、命中排名、无效/未揭示分类与只读
+tests/test_calibration_report.py # 概率校准报告：0/1 前置校验、概率解析、Brier 均分、十区间边界与只读
 tests/test_merkle.py          # Merkle 纯函数：空根/单叶、末项复制、域分离、成员证明与严格层级校验
 tests/test_merkle_proofs_api.py  # 集合证明 API：阶段门禁、根/证明签发、本地校验、404/409 与现有流程不受影响
 Dockerfile

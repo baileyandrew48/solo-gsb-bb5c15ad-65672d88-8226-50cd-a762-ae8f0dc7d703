@@ -342,6 +342,83 @@ class HashOut(BaseModel):
     hash_scheme: str
 
 
+class CalibrationReportRequest(BaseModel):
+    event_ids: list[UUID] = Field(
+        min_length=1,
+        max_length=100,
+        description="待校准的 1～100 个事件 ID（重复 ID 自动去重；任一事件不存在、未结算或结算结果不是精确的 0/1 均报错）",
+    )
+
+
+class CalibrationPredictionOut(BaseModel):
+    event_id: UUID = Field(description="该预测所属事件")
+    commitment_id: UUID = Field(description="揭示对应的承诺 ID")
+    committed_at: datetime = Field(description="承诺提交时间（UTC）")
+    original_text: str = Field(description="揭示原文（逐字回显，已解析为 [0,1] 概率）")
+    probability: str = Field(
+        description="原文解析出的概率（[0,1] 十进制数，四舍六入五成双至 6 位小数；原文另在 original_text 逐字回显）"
+    )
+    actual: int = Field(description="该事件结算标准结果对应的实际结果：0 或 1")
+    squared_error: str = Field(
+        description="本条预测的平方误差 (概率 - 实际)^2，四舍六入五成双至 6 位小数字符串"
+    )
+
+
+class CalibrationInvalidOut(BaseModel):
+    event_id: UUID = Field(description="该无效原文所属事件")
+    commitment_id: UUID = Field(description="揭示对应的承诺 ID")
+    committed_at: datetime = Field(description="承诺提交时间（UTC）")
+    original_text: str = Field(description="无法作为 [0,1] 概率使用的揭示原文（逐字回显）")
+    reason: str = Field(
+        description="无效原因：INVALID_FORMAT（含空白/符号/指数或不是纯十进制记法）| OUT_OF_RANGE（数值不在 [0,1]）"
+    )
+
+
+class CalibrationBinOut(BaseModel):
+    index: int = Field(description="区间下标，0～9（固定顺序，不随数据变化）")
+    lower_inclusive: str = Field(description="区间下界（含），6 位小数字符串")
+    upper_exclusive: str = Field(
+        description="区间上界（前九个不含；index=9 的 [0.9,1] 含上界 1），6 位小数字符串"
+    )
+    mean_prediction: Optional[str] = Field(
+        default=None,
+        description="落入该区间的有效预测概率均值，四舍六入五成双至 6 位小数；空样本为 null",
+    )
+    positive_rate: Optional[str] = Field(
+        default=None,
+        description="该区间内实际结果为 1 的频率，四舍六入五成双至 6 位小数；空样本为 null",
+    )
+    sample_count: int = Field(description="落入该区间的有效预测样本数")
+
+
+class CalibrationReportOut(BaseModel):
+    generated_at: datetime
+    event_count: int = Field(description="去重后实际参与校准的事件数量")
+    event_ids: list[UUID] = Field(
+        description="去重后参与校准的事件 ID（按请求首次出现顺序，固定排列）"
+    )
+    revealed_count: int = Field(description="这些事件的已揭示承诺总数（= 有效数 + 无效数）")
+    unrevealed_commitment_count: int = Field(
+        description="这些事件中从未揭示的承诺总数（单独统计，不参与概率解析）"
+    )
+    valid_prediction_count: int = Field(description="成功解析为 [0,1] 概率的揭示数")
+    invalid_prediction_count: int = Field(description="无法作为 [0,1] 概率使用的揭示数")
+    brier_mean: Optional[str] = Field(
+        default=None,
+        description="全部有效预测平方误差的算术平均（Brier 均分），四舍六入五成双至 6 位小数；无有效样本为 null",
+    )
+    bins: list[CalibrationBinOut] = Field(
+        description="十个固定概率区间的汇总（[0,0.1) … [0.9,1]，下标 0～9 固定顺序）"
+    )
+    valid_predictions: list[CalibrationPredictionOut] = Field(
+        description="有效预测明细，按 (事件请求序, 承诺提交时间, 承诺 ID) 固定排序"
+    )
+    invalid_predictions: list[CalibrationInvalidOut] = Field(
+        description="无效揭示原文明细（逐条列出），排序与有效预测一致"
+    )
+
+
+
 class MerkleProofStep(BaseModel):
     sibling: str = Field(
         pattern=COMMITMENT_HASH_PATTERN,
